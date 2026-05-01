@@ -11,6 +11,8 @@ from supabase import create_client
 from datetime import datetime, timezone
 import random
 import time
+import requests
+import ipaddress
 
 # ---------------- SUPABASE CONFIG ----------------
 SUPABASE_URL = "https://mynvptcdzwebyialuzpu.supabase.co"
@@ -33,14 +35,52 @@ DOS_TARGET_PORTS = [80, 443, 8080, 8443, 53, 22, 3389]  # HTTP, HTTPS, DNS, SSH,
 
 # ---------------- ATTACKER IP RANGES (for simulation) ----------------
 ATTACKER_IP_POOL = [
-    "192.168.1.{}",
-    "10.0.0.{}",
-    "172.16.0.{}",
-    "203.0.113.{}",  # Example public IPs
+    "8.8.8.{}",
+    "114.114.114.{}",
+    "45.33.94.{}",
+    "93.177.102.{}",  # Example public IPs
     "198.51.100.{}",
     "185.220.100.{}",  # More attacker IPs
     "45.67.230.{}"
 ]
+
+# =====================================================
+# IP LOCATION CACHE & LOOKUP
+# =====================================================
+IP_CACHE = {}
+
+def get_ip_region(src_ip, dst_ip):
+    def is_public(ip):
+        try:
+            return not ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return False
+
+    target_ip = None
+    if is_public(src_ip):
+        target_ip = src_ip
+    elif is_public(dst_ip):
+        target_ip = dst_ip
+    
+    if not target_ip:
+        return "Private Network"
+        
+    if target_ip in IP_CACHE:
+        return IP_CACHE[target_ip]
+        
+    try:
+        response = requests.get(f"http://ip-api.com/json/{target_ip}", timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                region = data.get("regionName", data.get("country", "Unknown"))
+                IP_CACHE[target_ip] = region
+                return region
+    except Exception:
+        pass
+        
+    IP_CACHE[target_ip] = "Unknown"
+    return "Unknown"
 
 # ---------------- LOAD MODEL ----------------
 print("🔄 Loading ML model...")
@@ -228,7 +268,8 @@ def simulate_dos_attack(num_attacks=15):
             "tcp_flags": log_entry["tcp_flags"],
             "pkt_srcaddr": log_entry["pkt_srcaddr"],
             "pkt_dstaddr": log_entry["pkt_dstaddr"],
-            "region": log_entry["region"],
+            "region": get_ip_region(log_entry["srcaddr"], log_entry["dstaddr"]),
+            "datacenter": log_entry["region"],
             "flow_direction": log_entry["flow_direction"],
             "traffic_path": log_entry["traffic_path"],
             "interface_id": log_entry["interface_id"],

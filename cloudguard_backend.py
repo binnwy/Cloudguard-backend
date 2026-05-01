@@ -14,6 +14,8 @@ import time
 from datetime import datetime, timezone
 import json
 import os
+import requests
+import ipaddress
 
 # ---------------- CONFIGURATION ----------------
 LOG_GROUP = "/aws/vpc/flowlogs"
@@ -61,6 +63,45 @@ LABEL_MAP = {
     4: "BruteForce",
     5: "WebAttack"
 }
+
+# =====================================================
+# IP LOCATION CACHE & LOOKUP
+# =====================================================
+IP_CACHE = {}
+
+def get_ip_region(src_ip, dst_ip):
+    """Determine the public IP and fetch its geographical region."""
+    def is_public(ip):
+        try:
+            return not ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return False
+
+    target_ip = None
+    if is_public(src_ip):
+        target_ip = src_ip
+    elif is_public(dst_ip):
+        target_ip = dst_ip
+    
+    if not target_ip:
+        return "Private Network"
+        
+    if target_ip in IP_CACHE:
+        return IP_CACHE[target_ip]
+        
+    try:
+        response = requests.get(f"http://ip-api.com/json/{target_ip}", timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                region = data.get("regionName", data.get("country", "Unknown"))
+                IP_CACHE[target_ip] = region
+                return region
+    except Exception as e:
+        print(f"⚠️  Error fetching IP location for {target_ip}: {e}")
+        
+    IP_CACHE[target_ip] = "Unknown"
+    return "Unknown"
 
 # =====================================================
 # STATE MANAGEMENT (TRACK LAST PROCESSED TIMESTAMP)
@@ -254,7 +295,8 @@ def save_to_supabase(df):
             "tcp_flags": int(row["tcp_flags"]),
             "pkt_srcaddr": row["pkt_srcaddr"],
             "pkt_dstaddr": row["pkt_dstaddr"],
-            "region": row["region"],
+            "region": get_ip_region(row["srcaddr"], row["dstaddr"]),
+            "datacenter": row["region"],
             "flow_direction": row["flow_direction"],
             "traffic_path": row["traffic_path"],
             "interface_id": row["interface_id"],

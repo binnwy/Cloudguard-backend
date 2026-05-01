@@ -11,6 +11,8 @@ import time
 from datetime import datetime, timezone
 import json
 import os
+import requests
+import ipaddress
 
 # ---------------- CONFIGURATION ----------------
 LOG_GROUP = "/aws/vpc/flowlogs"
@@ -44,6 +46,45 @@ LABEL_MAP = {
     4: "BruteForce",
     5: "WebAttack"
 }
+
+# =====================================================
+# IP LOCATION CACHE & LOOKUP
+# =====================================================
+IP_CACHE = {}
+
+def get_ip_region(src_ip, dst_ip):
+    """Determine the public IP and fetch its geographical region."""
+    def is_public(ip):
+        try:
+            return not ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return False
+
+    target_ip = None
+    if is_public(src_ip):
+        target_ip = src_ip
+    elif is_public(dst_ip):
+        target_ip = dst_ip
+    
+    if not target_ip:
+        return "Private Network"
+        
+    if target_ip in IP_CACHE:
+        return IP_CACHE[target_ip]
+        
+    try:
+        response = requests.get(f"http://ip-api.com/json/{target_ip}", timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                region = data.get("regionName", data.get("country", "Unknown"))
+                IP_CACHE[target_ip] = region
+                return region
+    except Exception as e:
+        print(f"⚠️  Error fetching IP location for {target_ip}: {e}")
+        
+    IP_CACHE[target_ip] = "Unknown"
+    return "Unknown"
 
 # =====================================================
 # CUSTOM ENSEMBLE CLASS (MUST MATCH TRAINING FILE)
@@ -238,51 +279,57 @@ def save_to_supabase(df):
     if df.empty:
         return False
 
-    records = []
+    BATCH_SIZE = 10
 
-    for _, row in df.iterrows():
-        record = {
-            "srcaddr": row["srcaddr"],
-            "dstaddr": row["dstaddr"],
-            "srcport": int(row["srcport"]),
-            "dstport": int(row["dstport"]),
-            "protocol": int(row["protocol"]),
-            "packets": int(row["packets"]),
-            "bytes": int(row["bytes"]),
-            "start": int(row["start"]),
-            "end": int(row["end"]),
-            "action": row["action"],
-            "tcp_flags": int(row["tcp_flags"]),
-            "pkt_srcaddr": row["pkt_srcaddr"],
-            "pkt_dstaddr": row["pkt_dstaddr"],
-            "region": row["region"],
-            "flow_direction": row["flow_direction"],
-            "traffic_path": row["traffic_path"],
-            "interface_id": row["interface_id"],
-            "log_status": row["log_status"],
-            "predicted_label": int(row["Predicted_Label"]),
-            "confidence": float(row["Confidence"]),
-            "attack_type": row["Attack_Type"]
-        }
-        records.append(record)
+    total = len(df)
+    print(f"🚀 Saving {total} records in batches of {BATCH_SIZE}")
 
-    try:
-        records_with_timestamp = []
-        for i, record in enumerate(records):
-            rc = record.copy()
-            rc["processed_at"] = df.iloc[i]["processed_at"]
-            records_with_timestamp.append(rc)
+    for start in range(0, total, BATCH_SIZE):
+        batch_df = df.iloc[start:start+BATCH_SIZE]
 
-        supabase.table("cloudguard_logs").insert(records_with_timestamp).execute()
-        print(f"✅ Saved {len(records)} records to Supabase (with timestamps)")
-        return True
+        records = []
 
-    except Exception:
-        print("⚠️ processed_at column not found, saving without it...")
-        supabase.table("cloudguard_logs").insert(records).execute()
-        print(f"✅ Saved {len(records)} records to Supabase")
-        return True
+        for _, row in batch_df.iterrows():
 
+            # 🌍 region lookup (only 10 at a time now)
+            region = get_ip_region(row["srcaddr"], row["dstaddr"])
+
+            record = {
+                "srcaddr": row["srcaddr"],
+                "dstaddr": row["dstaddr"],
+                "srcport": int(row["srcport"]),
+                "dstport": int(row["dstport"]),
+                "protocol": int(row["protocol"]),
+                "packets": int(row["packets"]),
+                "bytes": int(row["bytes"]),
+                "start": int(row["start"]),
+                "end": int(row["end"]),
+                "action": row["action"],
+                "tcp_flags": int(row["tcp_flags"]),
+                "pkt_srcaddr": row["pkt_srcaddr"],
+                "pkt_dstaddr": row["pkt_dstaddr"],
+                "region": region,
+                "datacenter": row["region"],
+                "flow_direction": row["flow_direction"],
+                "traffic_path": row["traffic_path"],
+                "interface_id": row["interface_id"],
+                "log_status": row["log_status"],
+                "predicted_label": int(row["Predicted_Label"]),
+                "confidence": float(row["Confidence"]),
+                "attack_type": row["Attack_Type"]
+                
+            }
+
+            records.append(record)
+
+        try:
+            supabase.table("cloudguard_logs").insert(records).execute()
+            print(f"✅ Inserted batch {start//BATCH_SIZE + 1}")
+
+        except Exception as e:
+            print(f"❌ Error inserting batch: {e}")
+
+    return True
 # =====================================================
 # MAIN LOOP
 # =====================================================
